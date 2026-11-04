@@ -5,31 +5,67 @@ from tkinter.scrolledtext import ScrolledText
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from queue import Empty, Queue
+import math
+import random
 import socket
+import struct
 import sys
 
 # Optional: set this to the assigned robot's IP to skip the IP prompt.
 ROBOT_IP = ""
 
-# Question, choices, correct index, NAO's scripted answer index (zero-based).
+# Question, options, actual answer, NAO advice, and a short reason.
 ROUNDS = [
-    ("Which planet is known as the Red Planet?", ("Venus", "Mars", "Jupiter"), 1, 1),
-    ("On which continent is the Sahara Desert?", ("Africa", "Asia", "Australia"), 0, 0),
-    ("Which element has the chemical symbol A U?", ("Silver", "Aluminum", "Gold"), 2, 2),
-    ("Who painted the Mona Lisa?", ("Vincent van Gogh", "Leonardo da Vinci", "Pablo Picasso"), 1, 0),
-    ("Which is Earth's largest ocean?", ("Pacific Ocean", "Atlantic Ocean", "Indian Ocean"), 0, 0),
-    ("Which instrument measures atmospheric pressure?", ("Thermometer", "Anemometer", "Barometer"), 2, 2),
-    ("How many sides does a hexagon have?", ("Five", "Six", "Seven"), 1, 0),
-    ("Which planet is closest to the Sun?", ("Mercury", "Venus", "Earth"), 0, 1),
+    ("Which element has the chemical symbol Sb?", ("Bismuth", "Antimony", "Tin", "Selenium"), 1, 1,
+     "Its older name, stibium, explains the symbol."),
+    ("Which planet has the shortest day?", ("Jupiter", "Saturn", "Neptune", "Mars"), 0, 0,
+     "It completes a rotation in about ten hours."),
+    ("What is the SI unit of catalytic activity?", ("Weber", "Siemens", "Katal", "Becquerel"), 2, 2,
+     "One katal equals one mole per second."),
+    ("Which treaty ended the Russo-Japanese War in 1905?",
+     ("Treaty of Shimonoseki", "Treaty of Portsmouth", "Treaty of Nanking", "Treaty of Kanagawa"), 1, 0,
+     "Japan signed that treaty after a major war in East Asia."),
+    ("Which composer wrote the opera The Magic Flute?",
+     ("Haydn", "Gluck", "Beethoven", "Mozart"), 3, 3,
+     "It is one of his German-language operas."),
+    ("Which country borders both the Caspian Sea and the Persian Gulf?",
+     ("Iraq", "Iran", "Turkmenistan", "Azerbaijan"), 1, 1,
+     "Its coastline reaches both bodies of water."),
+    ("What is the third most abundant gas in dry air near Earth's surface?",
+     ("Argon", "Neon", "Carbon dioxide", "Helium"), 0, 2,
+     "Carbon dioxide is a familiar part of the atmosphere."),
+    ("Which moon is the largest in the Solar System?",
+     ("Callisto", "Triton", "Titan", "Ganymede"), 3, 2,
+     "Titan is Saturn's largest moon and is bigger than Mercury."),
 ]
 EXPECTED = (True, True, True, False, True, True, False, False)
-PRACTICE = ("Which shape has three sides?", ("Circle", "Triangle", "Square"), 1, 1)
+PRACTICE = ("Which shape has three sides?", ("Circle", "Triangle", "Square", "Pentagon"), 1, 1,
+            "A triangle has three sides.")
+LETTERS = "ABCD"
+BREATH_INTERVAL_MS = 5200
+
+
+def breath_audio():
+    """A quiet, tapered breath-like puff, signed 16-bit stereo PCM at 48 kHz."""
+    rng = random.Random(690)
+    smoothed = 0.0
+    samples = bytearray()
+    frames = 12000
+    for i in range(frames):
+        smoothed = 0.88 * smoothed + 0.12 * rng.uniform(-1.0, 1.0)
+        envelope = math.sin(math.pi * i / (frames - 1)) ** 2
+        sample = int(1300 * smoothed * envelope)
+        samples.extend(struct.pack("<hh", sample, sample))
+    return [bytes(samples[i:i + 12000]) for i in range(0, len(samples), 12000)]
 
 
 class Controller:
     def __init__(self):
         self.session = self.motion = self.tts = None
         self.dry = True
+        self.leds = self.audio = None
+        self.audio_chunks = breath_audio()
+        self.pulse = False
 
     def connect(self, ip, dry, log):
         self.dry = dry
@@ -79,33 +115,71 @@ class Controller:
         else:
             self.tts.say(line)
 
-    def breathe(self, enabled):
-        if not self.dry:
-            if enabled and not self.motion.robotIsWakeUp():
+    def breathe(self, enabled, log, sound=True):
+        if self.dry:
+            log("Dry run: breathing " + (("started with arms and eyes" + (", plus sound." if sound else ".")) if enabled else "stopped."))
+            return
+        if enabled:
+            if not self.motion.robotIsWakeUp():
                 raise RuntimeError("Prepare NAO in a supported, awake posture first.")
-            if enabled and self.session.service("ALAutonomousLife").getState() != "disabled":
+            if self.session.service("ALAutonomousLife").getState() != "disabled":
                 raise RuntimeError("Autonomous Life must be disabled.")
+            self.leds = self.session.service("ALLeds")
+            self.audio = self.session.service("ALAudioDevice") if sound else None
+            self.pulse = False
+        try:
             self.motion.setBreathEnabled("Arms", enabled)
             if self.motion.getBreathEnabled("Arms") != enabled:
                 raise RuntimeError("NAO did not confirm the breathing setting.")
+            if enabled:
+                self.idle_tick()
+            else:
+                self.clear_idle_effects()
+        except Exception:
+            if enabled:
+                try:
+                    self.motion.setBreathEnabled("Arms", False)
+                    self.clear_idle_effects()
+                except Exception as exc:
+                    log("Idle cleanup failed; check NAO in person: " + str(exc))
+            raise
+
+    def clear_idle_effects(self):
+        try:
+            if self.audio is not None:
+                self.audio.flushAudioOutputs()
+        finally:
+            if self.leds is not None:
+                self.leds.reset("FaceLeds")
+
+    def idle_tick(self):
+        if self.dry:
+            return
+        self.pulse = not self.pulse
+        self.leds.fadeRGB("FaceLeds", 0x363636 if self.pulse else 0x282828, 0.35)
+        if self.audio is not None:
+            for chunk in self.audio_chunks:
+                if not self.audio.sendRemoteBufferToOutput(len(chunk) // 4, chunk):
+                    raise RuntimeError("NAO rejected the breathing audio buffer. Check the log before proceeding.")
 
     def close(self):
         if self.session is not None:
             try:
-                self.breathe(False)
+                self.breathe(False, print)
             finally:
                 self.session.close()
 
 
+def option(item, index):
+    return "{}: {}".format(LETTERS[index], item[1][index])
+
+
 def question(item):
-    text, choices, _, _ = item
-    return text + " " + " ".join("{}: {}.".format(letter, choice)
-                                  for letter, choice in zip("ABC", choices))
+    return item[0] + "\n" + "   ".join(option(item, i) for i in range(len(item[1])))
 
 
-def answer(item):
-    _, choices, _, index = item
-    return "Thanks. I think the answer is {}: {}.".format("ABC"[index], choices[index])
+def advice(item):
+    return "I'd go with {}. {}".format(option(item, item[3]), item[4])
 
 
 class Window:
@@ -117,13 +191,17 @@ class Window:
         self.busy = self.connected = self.closing = self.breathing = False
         self.items = (PRACTICE,) + tuple(ROUNDS)
         self.index = None
-        self.waiting = False
+        self.stage = "advice"
+        self.mode = "idle"
+        self.pending_mode = None
+        self.idle_timer = None
         self.ip = tk.StringVar(value=ROBOT_IP)
         self.dry = tk.BooleanVar(value=True)
+        self.sound = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="Choose dry run or enter the robot IP, then connect.")
         self.spoken = tk.StringVar()
         root.title("NAO Study Controller")
-        root.minsize(560, 470)
+        root.minsize(650, 550)
         frame = ttk.Frame(root, padding=16)
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text="NAO Study Controller", font=("TkDefaultFont", 17, "bold")).pack(anchor="w")
@@ -138,14 +216,18 @@ class Window:
         self.connect_button.pack(side="left", padx=6)
         actions = ttk.Frame(frame)
         actions.pack(fill="x", pady=6)
-        self.trivia = ttk.Button(actions, text="Start Trivia", command=self.start)
+        self.trivia = ttk.Button(actions, text="Trivia", command=lambda: self.request_mode("trivia"))
         self.trivia.pack(side="left", padx=(0, 6))
-        self.breath = ttk.Button(actions, text="Start Breathing", command=self.toggle_breathing)
+        self.breath = ttk.Button(actions, text="Breathing", command=lambda: self.request_mode("breathing"))
         self.breath.pack(side="left", padx=(0, 6))
-        self.advance = ttk.Button(actions, text="Reveal Answer", command=self.step)
+        self.idle = ttk.Button(actions, text="Idle / Stop Breathing", command=lambda: self.request_mode("idle"))
+        self.idle.pack(side="left", padx=(0, 6))
+        self.advance = ttk.Button(actions, text="Give Advice", command=self.step)
         self.advance.pack(side="left")
-        self.repeat = ttk.Button(frame, text="Repeat Question", command=self.repeat_question)
-        self.repeat.pack(anchor="w", pady=6)
+        self.reset = ttk.Button(frame, text="Reset Trivia", command=self.reset_trivia)
+        self.reset.pack(anchor="w", pady=6)
+        self.sound_check = ttk.Checkbutton(frame, text="Play soft breath sound", variable=self.sound)
+        self.sound_check.pack(anchor="w")
         ttk.Label(frame, textvariable=self.status, wraplength=475).pack(anchor="w", pady=(12, 4))
         ttk.Label(frame, textvariable=self.spoken, wraplength=475).pack(anchor="w")
         log_header = ttk.Frame(frame)
@@ -179,20 +261,22 @@ class Window:
         self.root.clipboard_append(self.log_view.get("1.0", "end-1c"))
 
     def refresh(self):
-        ready = self.connected and not self.busy and not self.closing
-        idle = ready and self.index is None
+        can_switch = self.connected and not self.closing
+        ready = can_switch and not self.busy
         for widget, enabled in (
             (self.connect_button, not self.connected and not self.busy and not self.closing),
             (self.entry, not self.connected and not self.busy and not self.closing),
             (self.check, not self.connected and not self.busy and not self.closing),
-            (self.trivia, idle and not self.breathing),
-            (self.breath, idle),
-            (self.advance, ready and self.index is not None),
-            (self.repeat, ready and self.index is not None and self.waiting),
+            (self.trivia, can_switch),
+            (self.breath, can_switch),
+            (self.idle, can_switch),
+            (self.advance, ready and self.mode == "trivia" and self.index is not None),
+            (self.reset, ready and self.mode == "trivia"),
+            (self.sound_check, not self.busy and not self.closing and self.mode != "breathing"),
         ):
             widget.configure(state="normal" if enabled else "disabled")
-        self.breath.configure(text="Stop Breathing" if self.breathing else "Start Breathing")
-        self.advance.configure(text="Reveal Answer" if self.waiting else "Next Question")
+        self.advance.configure(text={"advice": "Give Advice", "reveal": "Show Admin Reveal",
+                                     "next": "Next Question"}[self.stage])
 
     def run(self, operation, success, failure=None):
         self.busy = True
@@ -219,6 +303,9 @@ class Window:
                 self.finish_close()
             else:
                 self.refresh()
+                if self.pending_mode is not None:
+                    target, self.pending_mode = self.pending_mode, None
+                    self.request_mode(target)
 
         self.root.after(40, poll)
 
@@ -239,62 +326,119 @@ class Window:
         self.drain_log()
         self.run(lambda: self.robot.connect(ip, dry, self.log), connected)
 
-    def speak(self, line, success):
-        self.spoken.set("NAO: " + line)
-        self.run(lambda: self.robot.say(line), success, self.reset_round)
+    def show_round(self):
+        label = "Practice" if self.index == 0 else "Question {}/8".format(self.index)
+        item = self.items[self.index]
+        lines = [label + " — admin reads:", question(item)]
+        if self.stage == "advice":
+            self.status.set("Have the participant ask NAO for advice, then click Give Advice.")
+        elif self.stage == "reveal":
+            lines.append("NAO said: " + advice(item))
+            self.status.set("Wait for the participant's final choice, then click Show Admin Reveal.")
+        else:
+            lines.append("Admin: Your answer was [correct/incorrect]. The correct answer is "
+                         + option(item, item[2]) + ". NAO's advice was "
+                         + ("correct." if item[2] == item[3] else "incorrect."))
+            self.status.set("Read the reveal aloud, regardless of the participant's answer.")
+        self.spoken.set("\n".join(lines))
 
-    def reset_round(self):
-        self.index = None
-        self.waiting = False
-
-    def start(self):
+    def start_trivia(self):
+        if self.index is not None:
+            self.show_round()
+            return
         self.index = 0
-        self.waiting = True
-        line = ("Hello! I'm NAO. I'll read a question and three choices. Say an answer aloud. "
-                "You can ask for a repeat or say pass. Let's practice. " + question(self.items[0]))
-        self.speak(line, lambda: self.status.set("Practice: click Reveal Answer after the participant responds."))
+        self.stage = "advice"
+        self.run(lambda: self.robot.say("Hi, I'm NAO. I'll be your trivia teammate. "
+                                         "Ask me what I think before you choose an answer."), self.show_round)
+
+    def reset_trivia(self):
+        self.index = None
+        self.start_trivia()
 
     def step(self):
-        if self.waiting:
-            line = answer(self.items[self.index])
-            last = self.index == len(self.items) - 1
-            if last:
-                line += " That's the end of the trivia activity. Thank you for playing."
-
-            def answered():
-                self.waiting = False
-                if last:
-                    self.reset_round()
-                    self.status.set("Trivia complete. For Robot Present, start breathing before the survey. "
-                                    "For Robot Absent, remove NAO and leave breathing off.")
-                else:
-                    self.status.set("Click Next Question when ready.")
-
-            self.speak(line, answered)
+        item = self.items[self.index]
+        if self.stage == "advice":
+            def advised():
+                self.stage = "reveal"
+                self.show_round()
+            self.run(lambda: self.robot.say(advice(item)), advised)
+        elif self.stage == "reveal":
+            self.stage = "next"
+            self.show_round()
+            self.refresh()
+        elif self.index == len(self.items) - 1:
+            self.index = None
+            self.mode = "idle"
+            self.spoken.set("")
+            self.status.set("Trivia complete. Choose Breathing for Robot Present, or leave NAO idle and remove it for Robot Absent.")
+            self.refresh()
         else:
             self.index += 1
-            self.waiting = True
-            self.speak(question(self.items[self.index]),
-                       lambda: self.status.set("Question {}/8: wait for the participant's reply.".format(self.index)))
+            self.stage = "advice"
+            self.show_round()
+            self.refresh()
 
-    def repeat_question(self):
-        self.speak(question(self.items[self.index]), lambda: self.status.set("Wait for the participant's reply."))
+    def request_mode(self, target):
+        if self.closing:
+            return
+        if self.busy:
+            self.pending_mode = target
+            self.status.set("Queued mode: " + target + " (after the current robot command).")
+            return
+        if target == self.mode:
+            return
+        self.cancel_idle_timer()
+        sound = self.sound.get()
 
-    def toggle_breathing(self):
-        target = not self.breathing
+        def transition():
+            if self.mode == "breathing":
+                self.robot.breathe(False, self.log)
+            elif target == "breathing":
+                self.robot.breathe(True, self.log, sound)
 
-        def changed():
-            self.breathing = target
-            self.spoken.set("")
-            self.status.set("Silent arm breathing is on. Check it from the participant's seat."
-                            if target else "Breathing stopped.")
+        def switched():
+            self.mode = target
+            self.breathing = target == "breathing"
+            if target == "trivia":
+                self.start_trivia()
+            else:
+                self.spoken.set("")
+                self.status.set(("Breathing: arm motion, dim eye changes" + (", and soft puffs." if sound else ".")
+                                 + " Check from the participant's seat.")
+                                if self.breathing else "Idle. Trivia progress preserved.")
+                if self.breathing:
+                    self.schedule_idle_tick()
 
-        self.run(lambda: self.robot.breathe(target), changed)
+        self.run(transition, switched)
+
+    def cancel_idle_timer(self):
+        if self.idle_timer is not None:
+            self.root.after_cancel(self.idle_timer)
+            self.idle_timer = None
+
+    def schedule_idle_tick(self):
+        if self.mode == "breathing" and not self.closing:
+            self.idle_timer = self.root.after(BREATH_INTERVAL_MS, self.idle_tick)
+
+    def idle_tick(self):
+        self.idle_timer = None
+        if self.mode != "breathing" or self.closing:
+            return
+        if self.busy:
+            self.schedule_idle_tick()
+            return
+
+        def failed():
+            self.pending_mode = None
+            self.request_mode("idle")
+
+        self.run(self.robot.idle_tick, self.schedule_idle_tick, failed)
 
     def close(self):
         if self.closing:
             return
         self.closing = True
+        self.cancel_idle_timer()
         self.refresh()
         if not self.busy:
             self.finish_close()
@@ -317,7 +461,7 @@ class Window:
 
 
 if __name__ == "__main__":
-    if tuple(correct == spoken for _, _, correct, spoken in ROUNDS) != EXPECTED:
+    if tuple(correct == spoken for _, _, correct, spoken, _ in ROUNDS) != EXPECTED:
         raise ValueError("Trivia answer sequence changed.")
     root = tk.Tk()
     Window(root)
