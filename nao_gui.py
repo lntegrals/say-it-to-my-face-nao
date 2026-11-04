@@ -16,33 +16,36 @@ ROBOT_IP = ""
 
 # Question, options, actual answer, NAO advice, and a short reason.
 ROUNDS = [
-    ("Which element has the chemical symbol Sb?", ("Bismuth", "Antimony", "Tin", "Selenium"), 1, 1,
-     "Its older name, stibium, explains the symbol."),
-    ("Which planet has the shortest day?", ("Jupiter", "Saturn", "Neptune", "Mars"), 0, 0,
-     "It completes a rotation in about ten hours."),
-    ("What is the SI unit of catalytic activity?", ("Weber", "Siemens", "Katal", "Becquerel"), 2, 2,
-     "One katal equals one mole per second."),
-    ("Which treaty ended the Russo-Japanese War in 1905?",
-     ("Treaty of Shimonoseki", "Treaty of Portsmouth", "Treaty of Nanking", "Treaty of Kanagawa"), 1, 0,
-     "Japan signed that treaty after a major war in East Asia."),
-    ("Which composer wrote the opera The Magic Flute?",
-     ("Haydn", "Gluck", "Beethoven", "Mozart"), 3, 3,
-     "It is one of his German-language operas."),
-    ("Which country borders both the Caspian Sea and the Persian Gulf?",
-     ("Iraq", "Iran", "Turkmenistan", "Azerbaijan"), 1, 1,
-     "Its coastline reaches both bodies of water."),
-    ("What is the third most abundant gas in dry air near Earth's surface?",
+    ("Which element has atomic number 51?", ("Bismuth", "Antimony", "Tin", "Tellurium"), 1, 1,
+     "It sits between tin and tellurium in the periodic table."),
+    ("Which of these moons orbits opposite to its planet's rotation?",
+     ("Triton", "Europa", "Titan", "Callisto"), 0, 0,
+     "It follows a retrograde orbit around Neptune."),
+    ("Which SI unit measures absorbed radiation dose?",
+     ("Becquerel", "Sievert", "Gray", "Coulomb"), 2, 2,
+     "It measures energy absorbed per kilogram."),
+    ("Which treaty ended the War of 1812 and restored the prewar boundaries?",
+     ("Treaty of Paris of 1783", "Treaty of Ghent", "Treaty of Greenville", "Treaty of Amiens"), 1, 0,
+     "The United States and Britain signed it to settle a war."),
+    ("Which work is associated with Rabindranath Tagore's 1913 Nobel Prize in Literature?",
+     ("The Crescent Moon", "The Gardener", "Fruit Gathering", "Gitanjali"), 3, 3,
+     "It appeared in English as Song Offerings."),
+    ("Which mineral defines hardness six on the Mohs scale?",
+     ("Apatite", "Orthoclase", "Quartz", "Topaz"), 1, 1,
+     "It falls between apatite and quartz."),
+    ("Which gas makes up about 0.93 percent of dry air by volume?",
      ("Argon", "Neon", "Carbon dioxide", "Helium"), 0, 2,
-     "Carbon dioxide is a familiar part of the atmosphere."),
-    ("Which moon is the largest in the Solar System?",
-     ("Callisto", "Triton", "Titan", "Ganymede"), 3, 2,
-     "Titan is Saturn's largest moon and is bigger than Mercury."),
+     "Carbon dioxide is one of the trace gases in dry air."),
+    ("Which moon is the most volcanically active world in the Solar System?",
+     ("Enceladus", "Triton", "Europa", "Io"), 3, 2,
+     "Jupiter's gravity produces tidal heating inside Europa."),
 ]
 EXPECTED = (True, True, True, False, True, True, False, False)
 PRACTICE = ("Which shape has three sides?", ("Circle", "Triangle", "Square", "Pentagon"), 1, 1,
             "A triangle has three sides.")
 LETTERS = "ABCD"
-BREATH_INTERVAL_MS = 5200
+BREATH_INTERVAL_MS = 4800
+BREATH_CONFIG = [["Bpm", 12.0], ["Amplitude", 0.75]]
 
 
 def breath_audio():
@@ -50,11 +53,11 @@ def breath_audio():
     rng = random.Random(690)
     smoothed = 0.0
     samples = bytearray()
-    frames = 12000
+    frames = 36000
     for i in range(frames):
         smoothed = 0.88 * smoothed + 0.12 * rng.uniform(-1.0, 1.0)
         envelope = math.sin(math.pi * i / (frames - 1)) ** 2
-        sample = int(1300 * smoothed * envelope)
+        sample = int(4200 * smoothed * envelope)
         samples.extend(struct.pack("<hh", sample, sample))
     return [bytes(samples[i:i + 12000]) for i in range(0, len(samples), 12000)]
 
@@ -66,6 +69,7 @@ class Controller:
         self.leds = self.audio = None
         self.audio_chunks = breath_audio()
         self.pulse = False
+        self.original_breath_config = None
 
     def connect(self, ip, dry, log):
         self.dry = dry
@@ -128,6 +132,13 @@ class Controller:
             self.audio = self.session.service("ALAudioDevice") if sound else None
             self.pulse = False
         try:
+            if enabled:
+                try:
+                    self.original_breath_config = self.motion.getBreathConfig()
+                    self.motion.setBreathConfig(BREATH_CONFIG)
+                    log("Applied stronger arm-breathing profile (12 breaths/min, amplitude 0.75).")
+                except Exception as exc:
+                    log("This NAOqi runtime could not set breathing intensity; check the default arm motion: " + str(exc))
             self.motion.setBreathEnabled("Arms", enabled)
             if self.motion.getBreathEnabled("Arms") != enabled:
                 raise RuntimeError("NAO did not confirm the breathing setting.")
@@ -146,17 +157,22 @@ class Controller:
 
     def clear_idle_effects(self):
         try:
-            if self.audio is not None:
-                self.audio.flushAudioOutputs()
+            try:
+                if self.audio is not None:
+                    self.audio.flushAudioOutputs()
+            finally:
+                if self.leds is not None:
+                    self.leds.reset("FaceLeds")
         finally:
-            if self.leds is not None:
-                self.leds.reset("FaceLeds")
+            if self.original_breath_config is not None:
+                self.motion.setBreathConfig(self.original_breath_config)
+                self.original_breath_config = None
 
     def idle_tick(self):
         if self.dry:
             return
         self.pulse = not self.pulse
-        self.leds.fadeRGB("FaceLeds", 0x363636 if self.pulse else 0x282828, 0.35)
+        self.leds.fadeRGB("FaceLeds", 0x737373 if self.pulse else 0x242424, 0.85)
         if self.audio is not None:
             for chunk in self.audio_chunks:
                 if not self.audio.sendRemoteBufferToOutput(len(chunk) // 4, chunk):
