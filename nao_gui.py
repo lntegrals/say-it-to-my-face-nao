@@ -1,7 +1,12 @@
 """Operator window for NAO trivia and survey breathing."""
 import tkinter as tk
 from tkinter import ttk
+from tkinter.scrolledtext import ScrolledText
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from queue import Empty, Queue
+import socket
+import sys
 
 # Optional: set this to the assigned robot's IP to skip the IP prompt.
 ROBOT_IP = ""
@@ -26,24 +31,47 @@ class Controller:
         self.session = self.motion = self.tts = None
         self.dry = True
 
-    def connect(self, ip, dry):
+    def connect(self, ip, dry, log):
         self.dry = dry
         if dry:
+            log("Dry run: skipping network and NAOqi. No robot is connected.")
             return
-        import qi
+        log("Loading qi with Python: " + sys.executable)
+        try:
+            import qi
+        except ImportError as exc:
+            raise RuntimeError("Cannot load qi. Launch the GUI from your NAO lab Python environment: " + str(exc)) from exc
+        log("qi loaded.")
+        log("Checking TCP reachability at {}:9559 (5-second socket timeout)...".format(ip))
+        try:
+            with socket.create_connection((ip, 9559), timeout=5):
+                pass
+        except OSError as exc:
+            raise RuntimeError("Cannot reach {}:9559. Check NAO's IP, power, and network: {}".format(ip, exc)) from exc
+        log("TCP port 9559 is reachable. Opening the NAOqi session...")
         session = qi.Session()
         try:
             session.connect("tcp://{}:9559".format(ip))
-            if session.service("ALAutonomousLife").getState() != "disabled":
+            log("NAOqi session connected. Reading Autonomous Life state...")
+            state = session.service("ALAutonomousLife").getState()
+            log("Autonomous Life: " + str(state))
+            if state != "disabled":
                 raise RuntimeError("Disable Autonomous Life using the lab procedure first.")
+            log("Loading ALTextToSpeech...")
             tts = session.service("ALTextToSpeech")
+            log("Loading ALMotion...")
             motion = session.service("ALMotion")
+            log("Preparing idle motion settings...")
             motion.setIdlePostureEnabled("Body", False)
             motion.setBreathEnabled("Body", False)
         except Exception:
-            session.close()
+            try:
+                session.close()
+            except Exception as exc:
+                log("Could not close the failed session: " + str(exc))
             raise
         self.session, self.tts, self.motion = session, tts, motion
+        log("READY: connected to NAO at {}:9559. Trivia and breathing controls enabled.".format(ip))
 
     def say(self, line):
         if self.dry:
@@ -85,6 +113,7 @@ class Window:
         self.root = root
         self.robot = Controller()
         self.worker = ThreadPoolExecutor(max_workers=1)
+        self.log_queue = Queue()
         self.busy = self.connected = self.closing = self.breathing = False
         self.items = (PRACTICE,) + tuple(ROUNDS)
         self.index = None
@@ -94,7 +123,7 @@ class Window:
         self.status = tk.StringVar(value="Choose dry run or enter the robot IP, then connect.")
         self.spoken = tk.StringVar()
         root.title("NAO Study Controller")
-        root.minsize(510, 310)
+        root.minsize(560, 470)
         frame = ttk.Frame(root, padding=16)
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text="NAO Study Controller", font=("TkDefaultFont", 17, "bold")).pack(anchor="w")
@@ -119,8 +148,35 @@ class Window:
         self.repeat.pack(anchor="w", pady=6)
         ttk.Label(frame, textvariable=self.status, wraplength=475).pack(anchor="w", pady=(12, 4))
         ttk.Label(frame, textvariable=self.spoken, wraplength=475).pack(anchor="w")
+        log_header = ttk.Frame(frame)
+        log_header.pack(fill="x", pady=(12, 4))
+        ttk.Label(log_header, text="Connection log").pack(side="left")
+        ttk.Button(log_header, text="Copy Log", command=self.copy_log).pack(side="right")
+        self.log_view = ScrolledText(frame, height=9, width=60, wrap="word", state="disabled")
+        self.log_view.pack(fill="both", expand=True)
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.refresh()
+
+    def log(self, message):
+        line = "[{}] {}".format(datetime.now().strftime("%H:%M:%S"), message)
+        print(line, flush=True)
+        self.log_queue.put(line)
+
+    def drain_log(self):
+        while True:
+            try:
+                line = self.log_queue.get_nowait()
+            except Empty:
+                break
+            self.log_view.configure(state="normal")
+            self.log_view.insert("end", line + "\n")
+            self.log_view.configure(state="disabled")
+            self.log_view.see("end")
+
+    def copy_log(self):
+        self.drain_log()
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.log_view.get("1.0", "end-1c"))
 
     def refresh(self):
         ready = self.connected and not self.busy and not self.closing
@@ -144,6 +200,7 @@ class Window:
         future = self.worker.submit(operation)
 
         def poll():
+            self.drain_log()
             if not future.done():
                 self.root.after(40, poll)
                 return
@@ -152,10 +209,12 @@ class Window:
                 future.result()
             except Exception as exc:
                 self.status.set("Error: " + str(exc))
+                self.log("ERROR ({}): {}".format(type(exc).__name__, exc))
                 if failure:
                     failure()
             else:
                 success()
+            self.drain_log()
             if self.closing:
                 self.finish_close()
             else:
@@ -167,6 +226,8 @@ class Window:
         ip, dry = self.ip.get().strip(), self.dry.get()
         if not ip and not dry:
             self.status.set("Enter the IP of a stable, supported NAO with Autonomous Life disabled.")
+            self.log("Connection not started: robot IP is empty.")
+            self.drain_log()
             return
 
         def connected():
@@ -174,7 +235,9 @@ class Window:
             self.status.set("Dry run ready." if dry else "Connected to NAO.")
 
         self.status.set("Connecting...")
-        self.run(lambda: self.robot.connect(ip, dry), connected)
+        self.log("Connect clicked ({})".format("dry run" if dry else "live: " + ip))
+        self.drain_log()
+        self.run(lambda: self.robot.connect(ip, dry, self.log), connected)
 
     def speak(self, line, success):
         self.spoken.set("NAO: " + line)
