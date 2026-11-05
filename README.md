@@ -18,7 +18,7 @@ Answer-key sources, in question order: [Royal Society of Chemistry](https://peri
 
 ## Robot demonstration video
 
-**Video pending.** The team will add an embedded recording of NAO running the trivia interaction and the silent breathing mode here.
+[Watch the NAO demonstration video on SharePoint](https://kansas-my.sharepoint.com/:v:/g/personal/c510s010_home_ku_edu/IQAqBkvXadM1S5OQ3x_AGkHaAV24S6ji8hl14Sy--3Bq9rI)
 
 ## Generative AI use
 
