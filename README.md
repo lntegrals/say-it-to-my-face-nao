@@ -18,7 +18,7 @@ Answer-key sources, in question order: [Royal Society of Chemistry](https://peri
 
 ## Robot demonstration video
 
-[Watch the NAO demonstration video on SharePoint](https://kansas-my.sharepoint.com/:v:/g/personal/c510s010_home_ku_edu/IQAqBkvXadM1S5OQ3x_AGkHaAV24S6ji8hl14Sy--3Bq9rI)
+https://github.com/user-attachments/assets/43e9f56f-e2dd-4e08-9cb1-fe5ba73677fb
 
 ## Generative AI use
 
