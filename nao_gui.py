@@ -124,10 +124,14 @@ class Controller:
             log("Dry run: breathing " + (("started with arms and eyes" + (", plus sound." if sound else ".")) if enabled else "stopped."))
             return
         if enabled:
-            if not self.motion.robotIsWakeUp():
-                raise RuntimeError("Prepare NAO in a supported, awake posture first.")
             if self.session.service("ALAutonomousLife").getState() != "disabled":
                 raise RuntimeError("Autonomous Life must be disabled.")
+            if not self.motion.robotIsWakeUp():
+                log("Waking NAO's motion system before starting breathing...")
+                self.motion.wakeUp()
+                if not self.motion.robotIsWakeUp():
+                    raise RuntimeError("NAO did not confirm motor wake-up. Check its robot diagnostics.")
+                log("NAO's motion system is awake.")
             self.leds = self.session.service("ALLeds")
             self.audio = self.session.service("ALAudioDevice") if sound else None
             self.pulse = False
